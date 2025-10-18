@@ -5,7 +5,7 @@ import pandas as pd
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import numpy as np
 
 class MaskedLinear(nn.Module):
@@ -32,7 +32,6 @@ class FeatureScaler(nn.Module):
     def __init__(self, features):
         super().__init__()
         self.features = features
-        # Learnable scaling weights, initialized to 1
         self.ws = nn.Parameter(torch.ones(features))
 
     def forward(self, x):
@@ -53,25 +52,20 @@ class HINN(nn.Module):
                  dropout_prob=0.7):
         super().__init__()
 
-        # 1. SNP to CpG layer (Genetic influence on methylation)
         self.snp_to_cpg = MaskedLinear(snp_dim, cpg_dim, mask_snp_cpg, bias=True)
         self.g_cpg = FeatureScaler(cpg_dim)
         self.B2 = nn.Parameter(torch.zeros(cpg_dim))
 
-        # 2. CpG to Gene Expression layer (Epigenetic regulation of expression)
         self.cpg_to_gene = MaskedLinear(cpg_dim, gene_dim, mask_cpg_gene, bias=True)
         self.g_gene = FeatureScaler(gene_dim)
         self.B3 = nn.Parameter(torch.zeros(gene_dim))
 
-        # 3. Gene Expression to GO Term layer (Functional grouping)
         self.gene_to_go = MaskedLinear(gene_dim, go_dim, mask_gene_go, bias=True)
 
-        # --- Fully Connected Shortcut Layers ---
         self.snp_fc20 = nn.Linear(snp_dim, fc_nodes)
         self.cpg_fc20 = nn.Linear(cpg_dim + fc_nodes, fc_nodes)
         self.gene_fc20 = nn.Linear(gene_dim + fc_nodes, fc_nodes)
 
-        # --- Dense Layers for Prediction ---
         dense_input_dim = go_dim + fc_nodes
         self.dense_block1 = self._build_dense_block(dense_input_dim, hidden_dense_units, dropout_prob)
         self.dense_block2 = self._build_dense_block(hidden_dense_units, hidden_dense_units, dropout_prob)
@@ -80,11 +74,9 @@ class HINN(nn.Module):
         
         self.post_dense20 = nn.Linear(hidden_dense_units, 20)
 
-        # --- Demographic Data Integration ---
         demog_input_dim = 20 + demog_dim
         self.demog_block = self._build_dense_block(demog_input_dim, hidden_dense_units, dropout_prob)
         
-        # --- Output Layer ---
         self.output_layer = nn.Linear(hidden_dense_units, 1)
 
         for m in self.modules():
@@ -102,19 +94,13 @@ class HINN(nn.Module):
         )
 
     def forward(self, x_snp, x_cpg, x_gene, demog, eps=1e-8):
-        # Layer 1
         Y1 = F.relu(self.snp_to_cpg(x_snp))
-
-        # Layer 2
         gX2 = self.g_cpg(x_cpg)
         Y2 = F.relu((gX2 * Y1) + self.B2)
-
-        # Layer 3
         gX3 = self.g_gene(x_gene)
         fY2 = self.cpg_to_gene(Y2)
         denom = fY2 + eps
         Y3 = F.relu((gX3 / denom) + self.B3)
-
         Y4 = F.relu(self.gene_to_go(Y3))
 
         snp_fc_out = F.relu(self.snp_fc20(x_snp))
@@ -140,7 +126,7 @@ class HINN(nn.Module):
         out = self.output_layer(demog_h)
         return out.squeeze(-1)
 
-def load_and_prepare_data(target_column='ADAS11'):
+def load_and_prepare_data(target_column='MMSE'):
     try:
         demo_df = pd.read_csv('demo_label_data.csv')
         gene_df = pd.read_csv('gene_data.csv')
@@ -158,13 +144,15 @@ def load_and_prepare_data(target_column='ADAS11'):
     data = pd.merge(data, methyl_df, on='IID', how='inner')
     data = pd.merge(data, gene_df, on='IID', how='inner')
 
+    data.dropna(subset=[target_column], inplace=True)
+    
     demog_cols = ['AGE', 'GENDER', 'EDU', 'RACE', 'PTAU181', 'APOE']
     
     valid_targets = ['MMSE', 'MOCA', 'ADAS11', 'RAVLT.immediate']
     if target_column not in valid_targets:
         raise ValueError(f"Invalid target_column. Choose from: {valid_targets}")
 
-    y = data[target_column].values
+    y = data[target_column].values.reshape(-1, 1) # Reshape for scaler
     X_demog = data[demog_cols].values
     
     snp_features = [col for col in snp_df.columns if col != 'IID']
@@ -176,42 +164,48 @@ def load_and_prepare_data(target_column='ADAS11'):
     X_cpg = data[cpg_features].values
     X_gene = data[gene_features].values
 
-
-
     mask_snp_cpg = mask_snp_cpg_df.loc[snp_features, cpg_features].values
     mask_cpg_gene = mask_cpg_gene_df.loc[cpg_features, gene_features].values
+    
+    mask_gene_go = mask_gene_go_df.reindex(index=gene_features, columns=go_features, fill_value=0).values
 
-    mask_gene_go = mask_gene_go_df.loc[gene_features, go_features].values
+    scaler_demog = StandardScaler()
+    scaler_omics = StandardScaler()
+    y_scaler = MinMaxScaler()
 
-    scaler = StandardScaler()
-    X_demog_scaled = scaler.fit_transform(X_demog)
+    X_demog_scaled = scaler_demog.fit_transform(X_demog)
+    X_snp_scaled = scaler_omics.fit_transform(X_snp)
+    X_cpg_scaled = scaler_omics.fit_transform(X_cpg)
+    X_gene_scaled = scaler_omics.fit_transform(X_gene)
+    y_scaled = y_scaler.fit_transform(y)
 
-    X_snp_tensor = torch.FloatTensor(X_snp)
-    X_cpg_tensor = torch.FloatTensor(X_cpg)
-    X_gene_tensor = torch.FloatTensor(X_gene)
+    X_snp_tensor = torch.FloatTensor(X_snp_scaled)
+    X_cpg_tensor = torch.FloatTensor(X_cpg_scaled)
+    X_gene_tensor = torch.FloatTensor(X_gene_scaled)
     X_demog_tensor = torch.FloatTensor(X_demog_scaled)
-    y_tensor = torch.FloatTensor(y)
+    y_tensor = torch.FloatTensor(y_scaled).squeeze()
     
     mask_snp_cpg_tensor = torch.from_numpy(mask_snp_cpg).float()
     mask_cpg_gene_tensor = torch.from_numpy(mask_cpg_gene).float()
     mask_gene_go_tensor = torch.from_numpy(mask_gene_go).float()
     
-    return X_snp_tensor, X_cpg_tensor, X_gene_tensor, X_demog_tensor, y_tensor, mask_snp_cpg_tensor, mask_cpg_gene_tensor, mask_gene_go_tensor
+    return X_snp_tensor, X_cpg_tensor, X_gene_tensor, X_demog_tensor, y_tensor, \
+           mask_snp_cpg_tensor, mask_cpg_gene_tensor, mask_gene_go_tensor, y_scaler
 
 if __name__ == '__main__':
-    target_variable = 'ADAS11' 
+    target_variable = 'MMSE' 
     
-    data_tensors = load_and_prepare_data(target_column=target_variable)
+    result = load_and_prepare_data(target_column=target_variable)
     
-    if data_tensors is None:
+    if result is None:
         print("Data loading failed. Exiting.")
         exit()
 
-    X_snp, X_cpg, X_gene, X_demog, y, mask_snp_cpg, mask_cpg_gene, mask_gene_go = data_tensors
+    X_snp, X_cpg, X_gene, X_demog, y, mask_snp_cpg, mask_cpg_gene, mask_gene_go, y_scaler = result
     
     print(f"Number of samples: {len(y)}")
     
-    indices = list(range(len(y)))
+    indices = torch.arange(len(y))
     train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
 
     X_snp_train, X_snp_test = X_snp[train_indices], X_snp[test_indices]
@@ -240,42 +234,57 @@ if __name__ == '__main__':
         mask_snp_cpg=mask_snp_cpg,
         mask_cpg_gene=mask_cpg_gene,
         mask_gene_go=mask_gene_go,
-        demog_dim=demog_dim
+        demog_dim=demog_dim,
+        dropout_prob=0.7
     )
     
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
-    num_epochs = 500
+    num_epochs = 100
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         
         for i, (snp, cpg, gene, demog, labels) in enumerate(train_loader):
             optimizer.zero_grad()
-            
             outputs = model(snp, cpg, gene, demog)
             loss = criterion(outputs, labels)
-            
             loss.backward()
             optimizer.step()
-            
             running_loss += loss.item()
         
-        print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss/len(train_loader):.4f}')
+        avg_train_loss = running_loss / len(train_loader)
         
-
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for snp, cpg, gene, demog, labels in test_loader:
+                outputs = model(snp, cpg, gene, demog)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(test_loader)
+        scheduler.step(avg_val_loss)
+        
+        print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
+        
     model.eval()
     total_mae = 0
     total_mse = 0
     with torch.no_grad():
         for snp, cpg, gene, demog, labels in test_loader:
             outputs = model(snp, cpg, gene, demog)
-            mse = criterion(outputs, labels)
-            mae = F.l1_loss(outputs, labels) # Mean Absolute Error
             
-            total_mse += mse.item() * len(labels)
-            total_mae += mae.item() * len(labels)
+            outputs_rescaled = y_scaler.inverse_transform(outputs.unsqueeze(1).numpy())
+            labels_rescaled = y_scaler.inverse_transform(labels.unsqueeze(1).numpy())
+            
+            mse = ((outputs_rescaled - labels_rescaled) ** 2).mean()
+            mae = np.abs(outputs_rescaled - labels_rescaled).mean()
+            
+            total_mse += mse * len(labels)
+            total_mae += mae * len(labels)
 
     avg_mse = total_mse / len(test_dataset)
     avg_mae = total_mae / len(test_dataset)
