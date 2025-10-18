@@ -7,6 +7,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import numpy as np
+import plotly.graph_objects as go
 
 class MaskedLinear(nn.Module):
     def __init__(self, in_features, out_features, mask, bias=True):
@@ -126,6 +127,85 @@ class HINN(nn.Module):
         out = self.output_layer(demog_h)
         return out.squeeze(-1)
 
+def plot_sankey(model, snp_names, cpg_names, gene_names, go_names, top_k=4):
+    w_snp_cpg = torch.abs(model.snp_to_cpg.weight.data).numpy()
+    w_cpg_gene = torch.abs(model.cpg_to_gene.weight.data).numpy()
+    w_gene_go = torch.abs(model.gene_to_go.weight.data).numpy()
+
+    mask_snp_cpg = model.snp_to_cpg.mask.numpy()
+    mask_cpg_gene = model.cpg_to_gene.mask.numpy()
+    mask_gene_go = model.gene_to_go.mask.numpy()
+
+    def get_links(source_names, target_names, weights, mask, layer_top_k):
+        links = []
+        rows, cols = np.where(mask == 1)
+        for r, c in zip(rows, cols):
+            links.append({
+                'source': source_names[r],
+                'target': target_names[c],
+                'value': weights[r, c]
+            })
+
+        return sorted(links, key=lambda x: x['value'], reverse=True)[:layer_top_k]
+
+    top_links = []
+    top_links.extend(get_links(snp_names, cpg_names, w_snp_cpg, mask_snp_cpg, top_k))
+    top_links.extend(get_links(cpg_names, gene_names, w_cpg_gene, mask_cpg_gene, top_k))
+    top_links.extend(get_links(gene_names, go_names, w_gene_go, mask_gene_go, top_k))
+    
+    if not top_links:
+        print("No connections found to plot. Are the model weights all zero?")
+        return
+
+    node_labels = set()
+    for link in top_links:
+        node_labels.add(link['source'])
+        node_labels.add(link['target'])
+
+    ordered_labels = [n for n in snp_names if n in node_labels] + \
+                     [n for n in cpg_names if n in node_labels] + \
+                     [n for n in gene_names if n in node_labels] + \
+                     [n for n in go_names if n in node_labels]
+    
+    node_map = {name: i for i, name in enumerate(ordered_labels)}
+
+
+    link_data = {'source': [], 'target': [], 'value': []}
+    for link in top_links:
+        if link['source'] in node_map and link['target'] in node_map:
+            link_data['source'].append(node_map[link['source']])
+            link_data['target'].append(node_map[link['target']])
+            link_data['value'].append(link['value'])
+            
+    node_colors = []
+    for label in ordered_labels:
+        if label in snp_names:
+            node_colors.append('rgba(70, 186, 169, 0.8)')   # Teal for SNPs
+        elif label in cpg_names:
+            node_colors.append('rgba(238, 169, 104, 0.8)') # Orange for CpGs
+        elif label in gene_names:
+            node_colors.append('rgba(148, 133, 192, 0.8)') # Purple for Genes
+        else:
+            node_colors.append('rgba(224, 96, 144, 0.8)')  # Pink for GO Terms
+
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+          pad=15,
+          thickness=20,
+          line=dict(color="black", width=0.5),
+          label=ordered_labels,
+          color=node_colors
+        ),
+        link=dict(
+          source=link_data['source'],
+          target=link_data['target'],
+          value=link_data['value']
+      ))])
+
+    fig.update_layout(title_text=f"Top {top_k} Connections per Layer in HINN", font_size=10)
+    fig.show()
+
+
 def load_and_prepare_data(target_column='MMSE'):
     try:
         demo_df = pd.read_csv('demo_label_data.csv')
@@ -190,7 +270,9 @@ def load_and_prepare_data(target_column='MMSE'):
     mask_gene_go_tensor = torch.from_numpy(mask_gene_go).float()
     
     return X_snp_tensor, X_cpg_tensor, X_gene_tensor, X_demog_tensor, y_tensor, \
-           mask_snp_cpg_tensor, mask_cpg_gene_tensor, mask_gene_go_tensor, y_scaler
+           mask_snp_cpg_tensor, mask_cpg_gene_tensor, mask_gene_go_tensor, y_scaler, \
+           snp_features, cpg_features, gene_features, go_features
+
 
 if __name__ == '__main__':
     target_variable = 'MMSE' 
@@ -201,7 +283,9 @@ if __name__ == '__main__':
         print("Data loading failed. Exiting.")
         exit()
 
-    X_snp, X_cpg, X_gene, X_demog, y, mask_snp_cpg, mask_cpg_gene, mask_gene_go, y_scaler = result
+    X_snp, X_cpg, X_gene, X_demog, y, \
+    mask_snp_cpg, mask_cpg_gene, mask_gene_go, y_scaler, \
+    snp_names, cpg_names, gene_names, go_names = result
     
     print(f"Number of samples: {len(y)}")
     
@@ -291,3 +375,5 @@ if __name__ == '__main__':
     
     print(f'Mean Squared Error (MSE) on the test set: {avg_mse:.4f}')
     print(f'Mean Absolute Error (MAE) on the test set: {avg_mae:.4f}')
+
+    plot_sankey(model, snp_names, cpg_names, gene_names, go_names, top_k=3)
