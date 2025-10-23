@@ -6,3 +6,9 @@ https://pmc.ncbi.nlm.nih.gov/articles/PMC11712636/
 
 
 <img width="989" height="525" alt="newplot" src="https://github.com/user-attachments/assets/aece468d-a89f-4ace-be27-7f1afb15219d" />
+
+
+    git clone https://github.com/ayyucedemirbas/HINN_unofficial_paper_implementation.git
+    cd HINN_unofficial_paper_implementation
+    unzip -qq methyl_gene_matrix.csv.zip
+    python HINN.py
