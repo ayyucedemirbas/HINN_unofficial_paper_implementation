@@ -180,13 +180,13 @@ def plot_sankey(model, snp_names, cpg_names, gene_names, go_names, top_k=4):
     node_colors = []
     for label in ordered_labels:
         if label in snp_names:
-            node_colors.append('rgba(70, 186, 169, 0.8)')   # Teal for SNPs
+            node_colors.append('rgba(70, 186, 169, 0.8)')
         elif label in cpg_names:
-            node_colors.append('rgba(238, 169, 104, 0.8)') # Orange for CpGs
+            node_colors.append('rgba(238, 169, 104, 0.8)')
         elif label in gene_names:
-            node_colors.append('rgba(148, 133, 192, 0.8)') # Purple for Genes
+            node_colors.append('rgba(148, 133, 192, 0.8)')
         else:
-            node_colors.append('rgba(224, 96, 144, 0.8)')  # Pink for GO Terms
+            node_colors.append('rgba(224, 96, 144, 0.8)')
 
     fig = go.Figure(data=[go.Sankey(
         node=dict(
@@ -232,7 +232,7 @@ def load_and_prepare_data(target_column='MMSE'):
     if target_column not in valid_targets:
         raise ValueError(f"Invalid target_column. Choose from: {valid_targets}")
 
-    y = data[target_column].values.reshape(-1, 1) # Reshape for scaler
+    y = data[target_column].values.reshape(-1, 1)
     X_demog = data[demog_cols].values
     
     snp_features = [col for col in snp_df.columns if col != 'IID']
@@ -280,7 +280,7 @@ if __name__ == '__main__':
     result = load_and_prepare_data(target_column=target_variable)
     
     if result is None:
-        print("Data loading failed. Exiting.")
+        print("Data loading failed.")
         exit()
 
     X_snp, X_cpg, X_gene, X_demog, y, \
@@ -290,18 +290,29 @@ if __name__ == '__main__':
     print(f"Number of samples: {len(y)}")
     
     indices = torch.arange(len(y))
-    train_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
-
-    X_snp_train, X_snp_test = X_snp[train_indices], X_snp[test_indices]
-    X_cpg_train, X_cpg_test = X_cpg[train_indices], X_cpg[test_indices]
-    X_gene_train, X_gene_test = X_gene[train_indices], X_gene[test_indices]
-    X_demog_train, X_demog_test = X_demog[train_indices], X_demog[test_indices]
-    y_train, y_test = y[train_indices], y[test_indices]
+    train_val_indices, test_indices = train_test_split(indices, test_size=0.2, random_state=42)
     
+    train_indices, val_indices = train_test_split(train_val_indices, test_size=0.2, random_state=42)
+
+    X_snp_train, X_cpg_train = X_snp[train_indices], X_cpg[train_indices]
+    X_gene_train, X_demog_train = X_gene[train_indices], X_demog[train_indices]
+    y_train = y[train_indices]
+    
+    X_snp_val, X_cpg_val = X_snp[val_indices], X_cpg[val_indices]
+    X_gene_val, X_demog_val = X_gene[val_indices], X_demog[val_indices]
+    y_val = y[val_indices]
+    
+    X_snp_test, X_cpg_test = X_snp[test_indices], X_cpg[test_indices]
+    X_gene_test, X_demog_test = X_gene[test_indices], X_demog[test_indices]
+    y_test = y[test_indices]
+    
+
     train_dataset = TensorDataset(X_snp_train, X_cpg_train, X_gene_train, X_demog_train, y_train)
+    val_dataset = TensorDataset(X_snp_val, X_cpg_val, X_gene_val, X_demog_val, y_val)
     test_dataset = TensorDataset(X_snp_test, X_cpg_test, X_gene_test, X_demog_test, y_test)
     
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     snp_dim = X_snp.shape[1]
@@ -326,7 +337,9 @@ if __name__ == '__main__':
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 
-    num_epochs = 100
+    num_epochs = 20
+    best_val_loss = float('inf')
+    
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -344,16 +357,23 @@ if __name__ == '__main__':
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for snp, cpg, gene, demog, labels in test_loader:
+            for snp, cpg, gene, demog, labels in val_loader:
                 outputs = model(snp, cpg, gene, demog)
                 loss = criterion(outputs, labels)
                 val_loss += loss.item()
         
-        avg_val_loss = val_loss / len(test_loader)
+        avg_val_loss = val_loss / len(val_loader)
         scheduler.step(avg_val_loss)
         
-        print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            best_model_state = model.state_dict().copy()
         
+        print(f'Epoch [{epoch+1}/{num_epochs}], Training Loss: {avg_train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}')
+    
+    model.load_state_dict(best_model_state)
+    
+
     model.eval()
     total_mae = 0
     total_mse = 0
@@ -372,8 +392,8 @@ if __name__ == '__main__':
 
     avg_mse = total_mse / len(test_dataset)
     avg_mae = total_mae / len(test_dataset)
-    
-    print(f'Mean Squared Error (MSE) on the test set: {avg_mse:.4f}')
-    print(f'Mean Absolute Error (MAE) on the test set: {avg_mae:.4f}')
+
+    print(f'Mean Squared Error (MSE): {avg_mse:.4f}')
+    print(f'Mean Absolute Error (MAE): {avg_mae:.4f}')
 
     plot_sankey(model, snp_names, cpg_names, gene_names, go_names, top_k=3)
